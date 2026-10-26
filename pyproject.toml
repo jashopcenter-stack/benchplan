@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "benchplan"
+version = "0.1.0"
+description = "YAML test plans for SCPI instruments: run, judge against limits, report (HTML/JSON/CSV)."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "J. Sebastian Aguirre"}]
+keywords = ["scpi", "pyvisa", "test automation", "ate", "instrument control", "test sequencer", "manufacturing test"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Manufacturing",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Hardware",
+]
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+visa = ["pyvisa>=1.13", "pyvisa-py>=0.7"]
+dev = ["pytest>=7", "pyvisa>=1.13", "pyvisa-sim>=0.6"]
+
+[project.scripts]
+benchplan = "benchplan.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/CHANGE-ME/benchplan"
+
+[tool.setuptools.packages.find]
+include = ["benchplan*"]
+
+[tool.setuptools.package-data]
+benchplan = ["examples/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

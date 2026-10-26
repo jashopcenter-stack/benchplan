@@ -1,0 +1,179 @@
+# benchplan example: DC power supply acceptance test
+#
+# Instruments: a bench PSU (Rigol DP712-style SCPI), a 6½-digit DMM
+# (Keysight 34461A-style) and an electronic load (Rigol DL3021-style).
+#
+# Every instrument here is SIMULATED (resource: sim://...), so this plan runs
+# anywhere:   python -m benchplan demo
+# To use real hardware, replace each `resource` with a VISA string, e.g.
+#   TCPIP0::192.168.1.20::inst0::INSTR     (LAN / VXI-11)
+#   USB0::0x1AB1::0x0E11::DP7A000000001::INSTR
+#   ASRL3::INSTR                           (serial COM3)
+# and delete (or keep, it is ignored) the `sim:` block.
+
+name: DC Power Supply Acceptance Test
+version: "1.2"
+description: >-
+  Verifies setpoint accuracy, no-load and loaded output voltage, load
+  regulation, output ripple and the constant-current limit of a bench PSU.
+on_fail: continue            # continue | abort  (abort = stop at first FAIL/ERROR)
+
+variables:                   # available as {name} in commands and in expressions
+  v_set: 5.0                 # V
+  i_lim: 1.0                 # A  (PSU current limit)
+  i_half: 0.5                # A
+  i_full: 0.9                # A
+  i_over: 1.5                # A  (above the limit -> PSU must go into CC)
+
+instruments:
+  psu:
+    resource: sim://psu
+    timeout_ms: 5000
+    check_errors: false      # true -> query SYST:ERR? after every write (real instruments)
+    sim:
+      state_group: bench     # psu, dmm and load share one physical state
+      seed: 7                # deterministic noise for the demo
+      state: {v_set: 0.0, i_lim: 0.0, out: 0, load_i: 0.0, load_on: 0}
+      derived:               # recomputed before every response, in this order
+        li:    "load_i if load_on else 0.0"
+        cc:    "1 if (out and li > i_lim) else 0"
+        v_out: "0.0 if not out else (v_set * i_lim / li if cc else v_set - 0.012 * li)"
+        i_out: "0.0 if not out else (i_lim if cc else li)"
+      commands:              # regex (case-insensitive, full match) -> response / state update
+        '\*IDN\?': "RIGOL TECHNOLOGIES,DP712,DP7A000000001,00.01.01"
+        'APPL CH1,(?P<v>[-\d.]+),(?P<i>[-\d.]+)': {set: {v_set: "v", i_lim: "i"}}
+        'VOLT (?P<v>[-\d.]+)':  {set: {v_set: "v"}}
+        'CURR (?P<i>[-\d.]+)':  {set: {i_lim: "i"}}
+        'OUTP CH1,(?P<s>ON|OFF)': {set: {out: "1 if s == 'ON' else 0"}}
+        'VOLT\?': {response: "v_set"}
+        'CURR\?': {response: "i_lim"}
+        'MEAS:VOLT\?( CH1)?': {response: "v_out + gauss(0, 0.002)"}
+        'MEAS:CURR\?( CH1)?': {response: "i_out + gauss(0, 0.001)"}
+        ':?OUTP:CVCC\?( CH1)?': {response: "'CC' if cc else 'CV'"}
+
+  dmm:
+    resource: sim://dmm
+    sim:
+      state_group: bench
+      commands:
+        '\*IDN\?': "Keysight Technologies,34461A,MY00000001,A.03.03-03.15-03.15-00.52-04-03"
+        'CONF:VOLT:DC.*': {}
+        '(MEAS:VOLT:DC\?.*|READ\?)': {response: "v_out + gauss(0, 0.0003)"}
+        'MEAS:VOLT:AC\?.*': {response: "0.0012 + 0.0008 * li + gauss(0, 0.0001)"}
+
+  load:
+    resource: sim://load
+    sim:
+      state_group: bench
+      commands:
+        '\*IDN\?': "RIGOL TECHNOLOGIES,DL3021,DL3A000000001,00.01.05"
+        ':?(SOUR:)?CURR(:LEV)?(:IMM)? (?P<a>[-\d.]+)': {set: {load_i: "a"}}
+        ':?(SOUR:)?INP(:STAT)? (?P<s>ON|OFF|1|0)':   {set: {load_on: "1 if (s == 'ON' or s == 1) else 0"}}
+        'MEAS:CURR\?': {response: "i_out + gauss(0, 0.0005)"}
+        'MEAS:VOLT\?': {response: "v_out + gauss(0, 0.001)"}
+
+setup:                       # runs before the tests; failures here are ERRORs
+  - {instrument: psu,  write: "*RST"}
+  - {instrument: load, write: ":SOUR:INP:STAT OFF"}
+  - {instrument: load, write: ":SOUR:CURR:LEV:IMM 0"}
+  - {instrument: psu,  write: "APPL CH1,{v_set},{i_lim}"}
+  - {instrument: psu,  write: "OUTP CH1,ON"}
+  - {delay_ms: 300}                              # let the output settle
+
+steps:
+  - name: Identify PSU
+    instrument: psu
+    query: "*IDN?"
+    parse: str
+    limits: {regex: "DP7"}
+
+  - name: Identify DMM
+    instrument: dmm
+    query: "*IDN?"
+    parse: str
+    limits: {regex: "34461A"}
+
+  - name: Setpoint readback
+    instrument: psu
+    query: "VOLT?"
+    units: V
+    limits: {nominal: "{v_set}", tol: 0.005}
+
+  - name: No-load output voltage (DMM)
+    instrument: dmm
+    query: "MEAS:VOLT:DC? 10,0.0001"
+    units: V
+    limits: {nominal: "{v_set}", tol_pct: 0.5}
+    save_as: v_nl
+    retries: 1                                   # re-measure once if marginal
+
+  - name: Apply half load
+    instrument: load
+    write: ":SOUR:CURR:LEV:IMM {i_half}"
+  - {instrument: load, write: ":SOUR:INP:STAT ON"}
+  - {delay_ms: 200}
+
+  - name: Half-load output voltage (DMM)
+    instrument: dmm
+    query: "MEAS:VOLT:DC? 10,0.0001"
+    units: V
+    limits: {nominal: "{v_set}", tol_pct: 1.0}
+    save_as: v_hl
+
+  - name: Output current at half load (PSU readback)
+    instrument: psu
+    query: "MEAS:CURR? CH1"
+    units: A
+    limits: {nominal: "{i_half}", tol: 0.02}
+
+  - name: Apply full load
+    instrument: load
+    write: ":SOUR:CURR:LEV:IMM {i_full}"
+  - {delay_ms: 200}
+
+  - name: Full-load output voltage (DMM)
+    instrument: dmm
+    query: "MEAS:VOLT:DC? 10,0.0001"
+    units: V
+    limits: {nominal: "{v_set}", tol_pct: 1.0}
+    save_as: v_fl
+
+  - name: Load regulation
+    expr: "(v_nl - v_fl) / v_nl * 100"         # derived from saved measurements
+    units: "%"
+    limits: {max: 0.5}
+    note: (V_noload - V_fullload) / V_noload
+
+  - name: Output ripple at full load
+    instrument: dmm
+    query: "MEAS:VOLT:AC? 0.1,0.00001"
+    scale: 1000                                  # V -> mV
+    units: mV
+    limits: {max: 10}
+
+  - name: Apply overload
+    instrument: load
+    write: ":SOUR:CURR:LEV:IMM {i_over}"
+  - {delay_ms: 300}
+
+  - name: Current limit engages
+    instrument: psu
+    query: "MEAS:CURR? CH1"
+    units: A
+    limits: {nominal: "{i_lim}", tol: 0.05}
+
+  - name: PSU reports CC mode
+    instrument: psu
+    query: ":OUTP:CVCC? CH1"
+    parse: str
+    limits: {equals: CC}
+
+  - name: Voltage folds back in CC
+    instrument: psu
+    query: "MEAS:VOLT? CH1"
+    units: V
+    limits: {max: "v_set * 0.8"}                 # expressions allowed in limits
+
+teardown:                    # always runs, even after abort or errors
+  - {instrument: load, write: ":SOUR:INP:STAT OFF"}
+  - {instrument: psu,  write: "OUTP CH1,OFF"}

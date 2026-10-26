@@ -19,8 +19,9 @@ Simulated instrument block (inside ``instruments.<alias>.sim``)::
       commands:
         "VOLT (?P<v>[-\\d.]+)":   {set: {v_set: "v"}}
         "OUTP (?P<s>ON|OFF)":     {set: {out: "1 if s == 'ON' else 0"}}
-        "VOLT\\?":                "{v_set}"
-        "MEAS:VOLT\\?":           {response: "v_out + gauss(0, 0.001)"}
+        "VOLT\\?":                "{v_set}"                      # plain string = literal format string
+        "MEAS:VOLT\\?":           {response: "v_out + gauss(0, 0.001)"}   # response = expression
+        "SYST:ERR\\?":            {text: '0,"No error"'}         # text = literal (never evaluated)
 
 Command patterns are regular expressions matched case-insensitively against
 the whole command. Named groups become variables for ``set``/``response``
@@ -36,7 +37,8 @@ from typing import Any, Optional
 from .plan import InstrumentSpec
 from .safe_eval import ExprError, default_funcs, safe_eval
 
-__all__ = ["BaseInstrument", "SimInstrument", "VisaInstrument", "InstrumentError", "open_instrument"]
+__all__ = ["BaseInstrument", "SimInstrument", "VisaInstrument", "InstrumentError",
+           "open_instrument", "list_resources", "reset_sim_groups", "SimGroups"]
 
 
 class InstrumentError(RuntimeError):
@@ -79,15 +81,16 @@ class _SharedState:
         self.initial: dict[str, Any] = {}
         self.rng = random.Random(seed)
         self.funcs = default_funcs(self.rng)
-        self.derived: list[tuple[str, str]] = []
+        self.derived: dict[str, str] = {}
 
 
-_state_groups: dict[str, _SharedState] = {}
+SimGroups = dict  # alias -> _SharedState; one registry per Runner
+_default_groups: SimGroups = {}
 
 
 def reset_sim_groups() -> None:
-    """Forget all shared simulation state (used between runs/tests)."""
-    _state_groups.clear()
+    """Forget the module-level shared simulation state (used by the CLI/tests)."""
+    _default_groups.clear()
 
 
 def _to_number(s: str) -> Any:
@@ -99,34 +102,52 @@ def _to_number(s: str) -> Any:
         return s
 
 
+class _FormatEnv(dict):
+    def __missing__(self, key):
+        raise InstrumentError(f"unknown placeholder '{{{key}}}' in simulated response")
+
+
+def _fmt_number(v: Any) -> str:
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, int):
+        return str(v)
+    return f"{float(v):.6E}"  # SCPI-style exponent notation, e.g. 4.998000E+00
+
+
 class SimInstrument(BaseInstrument):
     DEFAULT_COMMANDS = {
         r"\*IDN\?": "BENCHPLAN,SIM-{__alias__},0,0.1",
-        r"SYST:ERR\?": '0,"No error"',
-        r"\*OPC\?": "1",
+        r"SYST:ERR\?": {"text": '0,"No error"'},
+        r"\*OPC\?": {"text": "1"},
         r"\*RST": {"reset": True},
         r"\*CLS": {},
     }
 
-    def __init__(self, spec: InstrumentSpec):
+    def __init__(self, spec: InstrumentSpec, groups: Optional[SimGroups] = None):
         super().__init__(spec)
         sim = spec.sim or {}
+        groups = _default_groups if groups is None else groups
         group = str(sim.get("state_group") or spec.alias)
         seed = sim.get("seed")
-        shared = _state_groups.get(group)
+        shared = groups.get(group)
         if shared is None:
-            shared = _SharedState(seed if seed is None else int(seed))
-            _state_groups[group] = shared
+            shared = _SharedState(None if seed is None else int(seed))
+            groups[group] = shared
+        elif seed is not None:
+            shared.rng.seed(int(seed))  # any member may pin the group's seed
         self.state = shared
         for k, v in (sim.get("state") or {}).items():
-            self.state.initial.setdefault(k, v)
+            self.state.initial[k] = v
             self.state.values.setdefault(k, v)
         for k, expr in (sim.get("derived") or {}).items():
-            if all(k != dk for dk, _ in self.state.derived):
-                self.state.derived.append((k, str(expr)))
+            self.state.derived[str(k)] = str(expr)
         self.rules: list[tuple[re.Pattern, Any]] = []
         for pattern, rule in (sim.get("commands") or {}).items():
-            self.rules.append((re.compile(str(pattern), re.IGNORECASE), rule))
+            try:
+                self.rules.append((re.compile(str(pattern), re.IGNORECASE), rule))
+            except re.error as exc:
+                raise InstrumentError(f"[{self.alias}] bad sim command pattern {pattern!r}: {exc}") from None
         for pattern, rule in self.DEFAULT_COMMANDS.items():
             self.rules.append((re.compile(pattern, re.IGNORECASE), rule))
         self.opened = False
@@ -142,7 +163,7 @@ class SimInstrument(BaseInstrument):
     def _env(self, extra: Optional[dict] = None) -> dict[str, Any]:
         env = dict(self.state.values)
         env["__alias__"] = self.alias
-        for key, expr in self.state.derived:
+        for key, expr in self.state.derived.items():
             try:
                 env[key] = safe_eval(expr, env, self.state.funcs)
             except ExprError as exc:
@@ -161,9 +182,8 @@ class SimInstrument(BaseInstrument):
         raise KeyError(cmd)
 
     def _apply(self, rule: Any, groups: dict) -> Optional[str]:
-        if isinstance(rule, str):
-            env = self._env(groups)
-            return rule.format_map(_FormatEnv(env))
+        if isinstance(rule, str):                      # plain string: literal format string
+            return rule.format_map(_FormatEnv(self._env(groups)))
         if rule is None:
             return None
         if not isinstance(rule, dict):
@@ -177,17 +197,21 @@ class SimInstrument(BaseInstrument):
             except ExprError as exc:
                 raise InstrumentError(f"[{self.alias}] set '{key}': {exc}") from None
             env[key] = self.state.values[key]
+        if "text" in rule:                             # literal, never evaluated
+            return str(rule["text"]).format_map(_FormatEnv(env))
         if "response" not in rule:
             return None
         resp = rule["response"]
-        if isinstance(resp, (int, float, bool)):
+        if isinstance(resp, bool) or isinstance(resp, (int, float)):
             return _fmt_number(resp)
         try:
             value = safe_eval(resp, env, self.state.funcs)
-        except ExprError:
-            # not an expression: treat as a format string
-            return str(resp).format_map(_FormatEnv(env))
-        return _fmt_number(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+        except ExprError as exc:
+            raise InstrumentError(f"[{self.alias}] response expression {str(resp)!r}: {exc} "
+                                  f"(use 'text:' for a literal response)") from None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return str(value)
+        return _fmt_number(value)
 
     # -- SCPI
     def write(self, command: str) -> None:
@@ -207,22 +231,9 @@ class SimInstrument(BaseInstrument):
         resp = self._apply(rule, groups)
         if resp is None:
             raise InstrumentError(f"[{self.alias}] {command.strip()!r} is a write-only command "
-                                  f"in the simulation (no 'response')")
+                                  f"in the simulation (no 'response' or 'text')")
         self.log.append(("Q", command, resp))
         return resp
-
-
-class _FormatEnv(dict):
-    def __missing__(self, key):
-        raise InstrumentError(f"unknown placeholder '{{{key}}}' in simulated response")
-
-
-def _fmt_number(v: Any) -> str:
-    if isinstance(v, bool):
-        return "1" if v else "0"
-    if isinstance(v, int):
-        return str(v)
-    return f"{float(v):.6E}"  # SCPI-style exponent notation, e.g. 4.998000E+00
 
 
 # ---------------------------------------------------------------------- VISA
@@ -247,13 +258,18 @@ class VisaInstrument(BaseInstrument):
             self._res = self._rm.open_resource(self.spec.resource)
         except Exception as exc:  # pyvisa raises many different types
             raise InstrumentError(f"[{self.alias}] cannot open {self.spec.resource}: {exc}") from None
-        self._res.timeout = self.spec.timeout_ms
-        if self.spec.read_termination:
-            self._res.read_termination = self.spec.read_termination
-        if self.spec.write_termination:
-            self._res.write_termination = self.spec.write_termination
-        if self.spec.query_delay:
-            self._res.query_delay = self.spec.query_delay
+        try:
+            self._res.timeout = self.spec.timeout_ms
+            if self.spec.read_termination:
+                self._res.read_termination = self.spec.read_termination
+            if self.spec.write_termination:
+                self._res.write_termination = self.spec.write_termination
+            if self.spec.query_delay:
+                self._res.query_delay = self.spec.query_delay
+            if self.spec.baud_rate and hasattr(self._res, "baud_rate"):
+                self._res.baud_rate = self.spec.baud_rate
+        except Exception as exc:
+            raise InstrumentError(f"[{self.alias}] cannot configure {self.spec.resource}: {exc}") from None
 
     def close(self) -> None:
         for obj in (self._res, self._rm):
@@ -296,8 +312,9 @@ class VisaInstrument(BaseInstrument):
         return resp
 
 
-def open_instrument(spec: InstrumentSpec) -> BaseInstrument:
-    inst = SimInstrument(spec) if spec.is_sim else VisaInstrument(spec)
+def open_instrument(spec: InstrumentSpec, groups: Optional[SimGroups] = None) -> BaseInstrument:
+    """Open the right backend for ``spec``. ``groups`` scopes simulated shared state."""
+    inst = SimInstrument(spec, groups) if spec.is_sim else VisaInstrument(spec)
     inst.open()
     return inst
 
@@ -308,9 +325,15 @@ def list_resources(visa_library: str = "") -> list[str]:
         import pyvisa
     except ImportError:
         raise InstrumentError("pyvisa is not installed (pip install benchplan[visa])") from None
-    rm = pyvisa.ResourceManager(visa_library) if visa_library else pyvisa.ResourceManager()
+    try:
+        rm = pyvisa.ResourceManager(visa_library) if visa_library else pyvisa.ResourceManager()
+    except Exception as exc:
+        raise InstrumentError(f"no VISA backend available: {exc} "
+                              f"(pip install pyvisa-py, or install NI-VISA / Keysight IO Libraries)") from None
     try:
         return list(rm.list_resources())
+    except Exception as exc:
+        raise InstrumentError(f"listing VISA resources failed: {exc}") from None
     finally:
         rm.close()
 

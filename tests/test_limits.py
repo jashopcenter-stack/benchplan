@@ -56,6 +56,9 @@ def test_resolver_is_used():
 
 @pytest.mark.parametrize("spec", [
     {"tol": 0.1},                 # tol without nominal
+    {"nominal": 5.0},             # nominal that can never fail
+    {"nominal": 5.0, "tol": -1},  # negative tolerance
+    {"one_of": []},               # empty list
     {"min": 5, "max": 4},         # inverted
     {"bogus": 1},                 # unknown key
     {"min": "abc"},               # not a number
@@ -69,3 +72,25 @@ def test_malformed(spec):
 
 def test_empty_limits_pass():
     assert Limits().check("anything") == (True, "no limits")
+
+
+def test_bool_and_scpi_spellings_are_equivalent():
+    assert Limits.from_spec({"equals": True}).check("ON")[0]
+    assert Limits.from_spec({"equals": "ON"}).check(True)[0]
+    assert Limits.from_spec({"equals": "ON"}).check("1")[0]
+    assert Limits.from_spec({"equals": False}).check("OFF")[0]
+    assert not Limits.from_spec({"equals": True}).check("OFF")[0]
+    assert Limits.from_spec({"one_of": [True, False]}).check("off")[0]
+
+
+def test_literal_resolver_is_used_and_never_evaluates():
+    lit = lambda v: str(v).replace("{serial}", "1234-5678")
+    lim = Limits.from_spec({"equals": "{serial}"}, resolve_literal=lit)
+    assert lim.equals == "1234-5678" and lim.check("1234-5678")[0]
+    rx = Limits.from_spec({"regex": "^{serial}$"}, resolve_literal=lit)
+    assert rx.check("1234-5678")[0] and not rx.check("1234-5679")[0]
+
+
+def test_nominal_with_min_only_is_allowed():
+    lim = Limits.from_spec({"nominal": 5.0, "min": 4.0})
+    assert lim.check(4.5)[0] and not lim.check(3.9)[0]

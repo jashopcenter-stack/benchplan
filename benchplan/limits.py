@@ -4,15 +4,18 @@ A ``limits`` block in a plan step may contain any combination of:
 
     min: 4.95            lower bound (inclusive)
     max: 5.05            upper bound (inclusive)
-    nominal: 5.0         target value, used with ``tol`` or ``tol_pct``
+    nominal: 5.0         target value, used with ``tol`` and/or ``tol_pct``
     tol: 0.05            absolute tolerance around ``nominal`` (±)
     tol_pct: 1.0         percent tolerance around ``nominal`` (±)
-    equals: "ON"         exact match (string or number)
-    one_of: [A, B]       value must be one of the listed options
+    equals: "ON"         exact match (string or number; ON/OFF/TRUE/FALSE/1/0 are equivalent)
+    one_of: [CV, CC]     value must be one of the listed options
     regex: "^RIGOL"      value (as text) must match this regular expression
 
-Values may be literal numbers, ``{placeholders}`` or expressions that
-reference plan variables and earlier measurements, e.g. ``max: "v_set*1.01"``.
+Numeric values (min/max/nominal/tol/tol_pct) may be literal numbers,
+``{placeholders}`` or expressions over plan variables and earlier
+measurements, e.g. ``max: "v_set * 1.01"``.  ``equals``, ``one_of`` and
+``regex`` are literals: ``{placeholders}`` are substituted but nothing is
+evaluated, so ``equals: "{serial}"`` compares against the serial as text.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from typing import Any, Callable, Optional
 __all__ = ["Limits", "LimitError", "KNOWN_LIMIT_KEYS"]
 
 KNOWN_LIMIT_KEYS = ("min", "max", "nominal", "tol", "tol_pct", "equals", "one_of", "regex")
+NUMERIC_LIMIT_KEYS = ("min", "max", "nominal", "tol", "tol_pct")
 
 
 class LimitError(ValueError):
@@ -53,8 +57,14 @@ class Limits:
 
     # ------------------------------------------------------------------ build
     @classmethod
-    def from_spec(cls, spec: dict, resolve: Callable[[Any], Any] | None = None) -> "Limits":
-        """Build from a plan dict. ``resolve`` turns placeholders/expressions into values."""
+    def from_spec(cls, spec: dict, resolve: Callable[[Any], Any] | None = None,
+                  resolve_literal: Callable[[Any], Any] | None = None) -> "Limits":
+        """Build from a plan dict.
+
+        ``resolve`` turns numeric limit values (placeholders/expressions) into
+        numbers; ``resolve_literal`` substitutes placeholders in
+        ``equals``/``one_of``/``regex`` without evaluating anything.
+        """
         if not isinstance(spec, dict):
             raise LimitError(f"limits must be a mapping, got {type(spec).__name__}")
         unknown = [k for k in spec if k not in KNOWN_LIMIT_KEYS]
@@ -62,23 +72,28 @@ class Limits:
             raise LimitError(f"unknown limit key(s): {', '.join(unknown)}; "
                              f"allowed: {', '.join(KNOWN_LIMIT_KEYS)}")
         resolve = resolve or (lambda v: v)
+        resolve_literal = resolve_literal or (lambda v: v)
         kw: dict[str, Any] = {}
-        for key in ("min", "max", "nominal", "tol", "tol_pct"):
+        for key in NUMERIC_LIMIT_KEYS:
             if key in spec and spec[key] is not None:
                 val = resolve(spec[key])
+                if isinstance(val, bool):
+                    raise LimitError(f"limit '{key}' must be a number, got {val!r}")
                 try:
                     kw[key] = float(val)
                 except (TypeError, ValueError):
-                    raise LimitError(f"limit '{key}' must resolve to a number, got {val!r}") from None
+                    raise LimitError(f"limit '{key}' ({spec[key]!r}) must resolve to a number, got {val!r}") from None
+                if kw[key] != kw[key]:
+                    raise LimitError(f"limit '{key}' resolved to NaN")
         if "equals" in spec:
-            kw["equals"] = resolve(spec["equals"])
+            kw["equals"] = resolve_literal(spec["equals"])
         if "one_of" in spec:
             opts = spec["one_of"]
-            if not isinstance(opts, (list, tuple)):
-                raise LimitError("one_of must be a list")
-            kw["one_of"] = [resolve(o) for o in opts]
+            if not isinstance(opts, (list, tuple)) or not opts:
+                raise LimitError("one_of must be a non-empty list")
+            kw["one_of"] = [resolve_literal(o) for o in opts]
         if "regex" in spec:
-            pattern = str(spec["regex"])
+            pattern = str(resolve_literal(spec["regex"]))
             try:
                 re.compile(pattern)
             except re.error as exc:
@@ -87,8 +102,13 @@ class Limits:
         lim = cls(**kw)
         if (lim.tol is not None or lim.tol_pct is not None) and lim.nominal is None:
             raise LimitError("tol/tol_pct require a nominal value")
+        if lim.nominal is not None and all(v is None for v in (lim.tol, lim.tol_pct, lim.min, lim.max)):
+            raise LimitError("nominal needs a tolerance (tol or tol_pct) or min/max; "
+                             "a bare nominal would pass every value")
+        if lim.tol is not None and lim.tol < 0 or lim.tol_pct is not None and lim.tol_pct < 0:
+            raise LimitError("tolerances cannot be negative")
         if lim.min is not None and lim.max is not None and lim.min > lim.max:
-            raise LimitError(f"min ({lim.min}) is greater than max ({lim.max})")
+            raise LimitError(f"min ({lim.min:g}) is greater than max ({lim.max:g})")
         return lim
 
     # ----------------------------------------------------------------- bounds
@@ -177,9 +197,32 @@ class Limits:
         return ok, ("within limits" if ok else "; ".join(reasons))
 
 
-def _equal(a: Any, b: Any) -> bool:
-    """Loose equality: numbers compare numerically, strings case-insensitively."""
+_TRUE_WORDS = {"1", "ON", "TRUE", "YES"}
+_FALSE_WORDS = {"0", "OFF", "FALSE", "NO"}
+
+
+def _norm(v: Any) -> Any:
+    """Normalise booleans and their SCPI spellings so ON == True == 1 and OFF == False == 0."""
+    if isinstance(v, bool):
+        return 1.0 if v else 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().strip('"')
+    u = s.upper()
+    if u in _TRUE_WORDS:
+        return 1.0
+    if u in _FALSE_WORDS:
+        return 0.0
     try:
-        return float(a) == float(b)
-    except (TypeError, ValueError):
-        return str(a).strip().lower() == str(b).strip().lower()
+        return float(s)
+    except ValueError:
+        return u
+
+
+def _equal(a: Any, b: Any) -> bool:
+    """Loose equality: numbers compare numerically, strings case-insensitively,
+    ON/OFF/TRUE/FALSE/1/0 are interchangeable."""
+    na, nb = _norm(a), _norm(b)
+    if isinstance(na, float) and isinstance(nb, float):
+        return na == nb
+    return str(na) == str(nb)

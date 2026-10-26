@@ -7,9 +7,9 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-from .instruments import BaseInstrument, InstrumentError, open_instrument, sleep_ms
+from .instruments import BaseInstrument, InstrumentError, SimGroups, open_instrument, sleep_ms
 from .limits import LimitError, Limits
-from .plan import Plan, Step
+from .plan import InstrumentSpec, Plan, Step
 from .safe_eval import ExprError, safe_eval
 
 __all__ = ["Runner", "RunResult", "StepResult", "run_plan", "STATUS_ORDER"]
@@ -92,19 +92,21 @@ class Runner:
     """Run a :class:`Plan`.
 
     ``on_step`` is called with each :class:`StepResult` as it completes
-    (used for live console output).
+    (used for live console output). ``open_fn(spec)`` may be supplied to
+    plug in custom instrument objects (anything with ``write``/``query``/``close``).
     """
 
     def __init__(self, plan: Plan, *, serial: str = "", operator: str = "",
                  variables: Optional[dict] = None, on_fail: Optional[str] = None,
                  on_step: Optional[Callable[[StepResult], None]] = None,
-                 open_fn: Callable[..., BaseInstrument] = open_instrument):
+                 open_fn: Optional[Callable[[InstrumentSpec], BaseInstrument]] = None):
         self.plan = plan
         self.serial = serial
         self.operator = operator
         self.on_fail = on_fail or plan.on_fail
         self.on_step = on_step or (lambda r: None)
-        self.open_fn = open_fn
+        self.sim_groups: SimGroups = {}            # simulated shared state lives per run
+        self.open_fn = open_fn or self._open_default
         self.variables: dict[str, Any] = dict(plan.variables)
         self.variables.update(variables or {})
         self.variables.setdefault("serial", serial)
@@ -112,6 +114,9 @@ class Runner:
         self.measurements: dict[str, Any] = {}
         self.instruments: dict[str, BaseInstrument] = {}
         self._index = 0
+
+    def _open_default(self, spec: InstrumentSpec) -> BaseInstrument:
+        return open_instrument(spec, self.sim_groups)
 
     # ------------------------------------------------------------ helpers
     def env(self) -> dict[str, Any]:
@@ -128,19 +133,23 @@ class Runner:
         except (ValueError, IndexError) as exc:
             raise ExprError(f"bad placeholder syntax in {text!r}: {exc}") from None
 
-    def resolve(self, value: Any) -> Any:
-        """Resolve a limit value: number, '{placeholder}' or expression."""
-        if isinstance(value, (int, float, bool)) or value is None:
+    def resolve_number(self, value: Any) -> Any:
+        """Resolve a numeric limit value: number, '{placeholder}' or expression."""
+        if isinstance(value, bool) or value is None:
+            return value
+        if isinstance(value, (int, float)):
             return value
         text = self.substitute(str(value))
         try:
             return float(text)
         except ValueError:
-            pass
-        try:
             return safe_eval(text, self.env())
-        except ExprError:
-            return text  # plain string (e.g. equals: "ON")
+
+    def resolve_literal(self, value: Any) -> Any:
+        """Substitute placeholders in a literal limit (equals/one_of/regex); never evaluates."""
+        if isinstance(value, str):
+            return self.substitute(value)
+        return value
 
     def _parse(self, raw: str, step: Step) -> Any:
         text = raw.strip()
@@ -173,6 +182,8 @@ class Runner:
             variables=dict(self.variables),
         )
         self._index = 0
+        self.measurements = {}
+        self.sim_groups.clear()
         try:
             self._open_all(result)
             try:
@@ -198,10 +209,11 @@ class Runner:
             inst = self.open_fn(spec)
             self.instruments[alias] = inst
             ident = spec.resource
-            try:
-                ident = inst.idn()
-            except InstrumentError:
-                pass
+            if hasattr(inst, "idn"):
+                try:
+                    ident = str(inst.idn())
+                except Exception:
+                    pass
             result.instruments[alias] = ident
 
     def _close_all(self) -> None:
@@ -212,6 +224,12 @@ class Runner:
                 pass
         self.instruments.clear()
 
+    def _notify(self, sr: StepResult) -> None:
+        try:
+            self.on_step(sr)
+        except Exception:
+            pass  # a logging/console problem must never abort a test run
+
     def _run_section(self, steps: list[Step], phase: str, result: RunResult, force: bool = False) -> None:
         for step in steps:
             self._index += 1
@@ -220,12 +238,12 @@ class Runner:
                                 instrument=step.instrument or "", message="skipped after abort",
                                 units=step.units, timestamp=_now_iso(), note=step.note)
                 result.steps.append(sr)
-                self.on_step(sr)
+                self._notify(sr)
                 continue
             sr = self._exec(step, phase)
             sr.index = self._index
             result.steps.append(sr)
-            self.on_step(sr)
+            self._notify(sr)
             mode = step.on_fail or self.on_fail
             if sr.status in (FAIL, ERROR) and mode == "abort" and phase != "teardown":
                 result.aborted = True
@@ -239,7 +257,8 @@ class Runner:
                 if safe_eval(self.substitute(step.skip_if), self.env()):
                     sr.status, sr.message = SKIP, f"skip_if: {step.skip_if}"
                     return sr
-            limits = Limits.from_spec(step.limits, self.resolve) if step.limits else None
+            limits = Limits.from_spec(step.limits, self.resolve_number, self.resolve_literal) \
+                if step.limits else None
             if limits is not None:
                 sr.limits = limits.describe(step.units)
             attempts = step.retries + 1
@@ -258,6 +277,8 @@ class Runner:
                 sr.message = f"{sr.message} (passed on attempt {sr.attempts})".strip()
         except (LimitError, ExprError) as exc:
             sr.status, sr.message = ERROR, str(exc)
+        except Exception as exc:
+            sr.status, sr.message = ERROR, f"{type(exc).__name__}: {exc}"
         finally:
             sr.duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
         return sr
@@ -282,8 +303,8 @@ class Runner:
             if step.auto_name:
                 sr.name = f"query {cmd}"
             raw = self.instruments[step.instrument].query(cmd)
-            sr.raw = raw
-            value = self._parse(raw, step)
+            sr.raw = str(raw)
+            value = self._parse(sr.raw, step)
         else:  # expr
             text = self.substitute(step.expr)
             sr.command = text

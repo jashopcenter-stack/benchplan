@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -58,10 +59,23 @@ def summary_lines(result: RunResult) -> list[str]:
 
 # -------------------------------------------------------------------- JSON
 
+def _json_clean(obj: Any) -> Any:
+    """Make a result JSON-safe: NaN/inf become null (bare NaN is not valid JSON)."""
+    if isinstance(obj, float):
+        return obj if obj == obj and obj not in (float("inf"), float("-inf")) else None
+    if isinstance(obj, dict):
+        return {str(k): _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_clean(v) for v in obj]
+    if isinstance(obj, (str, int, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+
 def write_json(result: RunResult, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result.to_dict(), indent=2, default=str), encoding="utf-8")
+    path.write_text(json.dumps(_json_clean(result.to_dict()), indent=2, allow_nan=False), encoding="utf-8")
     return path
 
 
@@ -77,7 +91,8 @@ def append_csv(result: RunResult, path: str | Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     new = not path.exists() or path.stat().st_size == 0
-    with path.open("a", newline="", encoding="utf-8") as fh:
+    # utf-8-sig writes a BOM on a new file so Excel shows ± ≤ ≥ correctly; appends stay plain UTF-8
+    with path.open("a", newline="", encoding="utf-8-sig" if new else "utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         if new:
             w.writeheader()
@@ -206,11 +221,19 @@ def write_html(result: RunResult, path: str | Path) -> Path:
 
 # ------------------------------------------------------------------- bundle
 
+def _safe_name(s: str, default: str) -> str:
+    """Make a string safe for file names on Windows/macOS/Linux."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", s.strip()).strip("-.")
+    return cleaned[:60] or default
+
+
 def write_all(result: RunResult, out_dir: str | Path, plan_slug: str, csv_name: str = "results.csv") -> dict[str, Path]:
+    """Write the HTML + JSON report and append to the CSV log. File names carry the
+    serial, a timestamp and the run id, so two runs in the same second never collide."""
     out = Path(out_dir)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    sn = (result.serial or "nosn").replace("/", "-").replace(" ", "_")
-    base = f"{plan_slug}_{sn}_{stamp}"
+    sn = _safe_name(result.serial, "nosn")
+    base = f"{_safe_name(plan_slug, 'plan')}_{sn}_{stamp}_{result.run_id[:6]}"
     return {
         "html": write_html(result, out / f"{base}.html"),
         "json": write_json(result, out / f"{base}.json"),

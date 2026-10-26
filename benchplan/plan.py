@@ -30,11 +30,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import yaml
 
-from .limits import KNOWN_LIMIT_KEYS
+from .limits import KNOWN_LIMIT_KEYS, LimitError, Limits
 
 __all__ = ["Plan", "Step", "InstrumentSpec", "PlanError", "load_plan", "plan_from_dict", "validate_plan"]
 
@@ -42,12 +42,11 @@ PARSE_MODES = ("auto", "float", "int", "str", "bool")
 ON_FAIL_MODES = ("continue", "abort")
 STEP_KEYS = {
     "name", "instrument", "write", "query", "expr", "delay_ms", "parse", "scale",
-    "units", "limits", "save_as", "retries", "retry_delay_ms", "on_fail", "skip_if",
-    "note", "timeout_ms",
+    "units", "limits", "save_as", "retries", "retry_delay_ms", "on_fail", "skip_if", "note",
 }
 INSTRUMENT_KEYS = {
     "resource", "timeout_ms", "read_termination", "write_termination", "query_delay",
-    "check_errors", "visa_library", "sim", "description",
+    "check_errors", "visa_library", "baud_rate", "sim", "description",
 }
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -66,6 +65,7 @@ class InstrumentSpec:
     query_delay: float = 0.0
     check_errors: bool = False
     visa_library: str = ""
+    baud_rate: Optional[int] = None
     description: str = ""
     sim: Optional[dict] = None
 
@@ -92,7 +92,6 @@ class Step:
     on_fail: Optional[str] = None
     skip_if: Optional[str] = None
     note: str = ""
-    timeout_ms: Optional[int] = None
     auto_name: bool = False
 
     @property
@@ -129,6 +128,32 @@ class Plan:
         return s or "plan"
 
 
+# ---------------------------------------------------------------- helpers
+
+def _coerce(raw: dict, key: str, cast: Callable[[Any], Any], default: Any, where: str,
+            minimum: Optional[float] = None) -> Any:
+    """Read raw[key] through ``cast`` with a readable error instead of a traceback."""
+    val = raw.get(key, default)
+    if val is None:
+        return default
+    if isinstance(val, bool) and cast is not bool:
+        raise PlanError(f"{where}: '{key}' must be a number, got {val!r}")
+    try:
+        out = cast(val)
+    except (TypeError, ValueError):
+        raise PlanError(f"{where}: '{key}' must be {cast.__name__}, got {val!r}") from None
+    if minimum is not None and out < minimum:
+        raise PlanError(f"{where}: '{key}' cannot be less than {minimum}")
+    return out
+
+
+def _unescape(s: Any) -> str:
+    """Allow "\\n" / "\\r\\n" written literally in YAML."""
+    if s is None:
+        return ""
+    return str(s).replace("\\r", "\r").replace("\\n", "\n")
+
+
 # ---------------------------------------------------------------- building
 
 def _step_from_dict(raw: Any, where: str) -> Step:
@@ -153,22 +178,21 @@ def _step_from_dict(raw: Any, where: str) -> Step:
     step = Step(
         name=str(name),
         auto_name=auto_name,
-        instrument=raw.get("instrument"),
+        instrument=None if raw.get("instrument") is None else str(raw["instrument"]),
         write=None if raw.get("write") is None else str(raw["write"]),
         query=None if raw.get("query") is None else str(raw["query"]),
         expr=None if raw.get("expr") is None else str(raw["expr"]),
-        delay_ms=None if raw.get("delay_ms") is None else float(raw["delay_ms"]),
-        parse=str(raw.get("parse", "auto")).lower(),
-        scale=float(raw.get("scale", 1.0)),
+        delay_ms=_coerce(raw, "delay_ms", float, None, where, minimum=0),
+        parse=str(raw.get("parse", "auto") or "auto").lower(),
+        scale=_coerce(raw, "scale", float, 1.0, where),
         units=str(raw.get("units", "") or ""),
         limits=raw.get("limits"),
-        save_as=raw.get("save_as"),
-        retries=int(raw.get("retries", 0) or 0),
-        retry_delay_ms=float(raw.get("retry_delay_ms", 200.0)),
-        on_fail=raw.get("on_fail"),
+        save_as=None if raw.get("save_as") is None else str(raw["save_as"]),
+        retries=_coerce(raw, "retries", int, 0, where, minimum=0),
+        retry_delay_ms=_coerce(raw, "retry_delay_ms", float, 200.0, where, minimum=0),
+        on_fail=None if raw.get("on_fail") is None else str(raw["on_fail"]).lower(),
         skip_if=None if raw.get("skip_if") is None else str(raw["skip_if"]),
         note=str(raw.get("note", "") or ""),
-        timeout_ms=None if raw.get("timeout_ms") is None else int(raw["timeout_ms"]),
     )
     if step.parse not in PARSE_MODES:
         raise PlanError(f"{where}: parse must be one of {', '.join(PARSE_MODES)}")
@@ -181,54 +205,54 @@ def _step_from_dict(raw: Any, where: str) -> Step:
         if bad:
             raise PlanError(f"{where}: unknown limit key(s) {', '.join(bad)}; "
                             f"allowed: {', '.join(KNOWN_LIMIT_KEYS)}")
-    if step.save_as is not None and not _IDENT.match(str(step.save_as)):
+    if step.save_as is not None and not _IDENT.match(step.save_as):
         raise PlanError(f"{where}: save_as must be a valid identifier, got {step.save_as!r}")
-    if step.retries < 0:
-        raise PlanError(f"{where}: retries cannot be negative")
     if step.kind in ("write", "query") and not step.instrument:
         raise PlanError(f"{where}: write/query steps need an 'instrument'")
     if step.kind in ("expr", "delay") and step.instrument:
         raise PlanError(f"{where}: expr/delay steps must not name an instrument")
     if step.kind == "write" and step.limits:
         raise PlanError(f"{where}: write steps cannot have limits (use a query)")
+    if step.kind == "delay" and (step.limits or step.save_as):
+        raise PlanError(f"{where}: delay steps cannot have limits or save_as")
     return step
 
 
 def _instrument_from_dict(alias: str, raw: Any) -> InstrumentSpec:
+    where = f"instrument '{alias}'"
     if isinstance(raw, str):
         raw = {"resource": raw}
     if not isinstance(raw, dict):
-        raise PlanError(f"instrument '{alias}' must be a mapping or a resource string")
+        raise PlanError(f"{where} must be a mapping or a resource string")
     unknown = sorted(set(raw) - INSTRUMENT_KEYS)
     if unknown:
-        raise PlanError(f"instrument '{alias}': unknown key(s) {', '.join(unknown)}")
+        raise PlanError(f"{where}: unknown key(s) {', '.join(unknown)}; "
+                        f"allowed: {', '.join(sorted(INSTRUMENT_KEYS))}")
     resource = raw.get("resource")
-    if not resource:
-        raise PlanError(f"instrument '{alias}' needs a 'resource' (VISA string or sim://name)")
+    if not resource or not isinstance(resource, str):
+        raise PlanError(f"{where} needs a 'resource' (VISA string or sim://name)")
     if not _IDENT.match(alias):
         raise PlanError(f"instrument alias {alias!r} must be a valid identifier")
     spec = InstrumentSpec(
         alias=alias,
-        resource=str(resource),
-        timeout_ms=int(raw.get("timeout_ms", 5000)),
+        resource=resource.strip(),
+        timeout_ms=_coerce(raw, "timeout_ms", int, 5000, where, minimum=1),
         read_termination=_unescape(raw.get("read_termination", "\n")),
         write_termination=_unescape(raw.get("write_termination", "\n")),
-        query_delay=float(raw.get("query_delay", 0.0)),
+        query_delay=_coerce(raw, "query_delay", float, 0.0, where, minimum=0),
         check_errors=bool(raw.get("check_errors", False)),
         visa_library=str(raw.get("visa_library", "") or ""),
+        baud_rate=_coerce(raw, "baud_rate", int, None, where, minimum=1),
         description=str(raw.get("description", "") or ""),
         sim=raw.get("sim"),
     )
     if spec.sim is not None and not isinstance(spec.sim, dict):
-        raise PlanError(f"instrument '{alias}': sim must be a mapping")
+        raise PlanError(f"{where}: sim must be a mapping")
+    if spec.sim is not None:
+        for key in ("state", "derived", "commands"):
+            if key in spec.sim and spec.sim[key] is not None and not isinstance(spec.sim[key], dict):
+                raise PlanError(f"{where}: sim.{key} must be a mapping")
     return spec
-
-
-def _unescape(s: Any) -> str:
-    """Allow "\\n" / "\\r\\n" written literally in YAML."""
-    if s is None:
-        return ""
-    return str(s).replace("\\r", "\r").replace("\\n", "\n")
 
 
 def plan_from_dict(raw: Any, source: str = "") -> Plan:
@@ -237,12 +261,15 @@ def plan_from_dict(raw: Any, source: str = "") -> Plan:
     name = raw.get("name")
     if not name:
         raise PlanError("plan needs a 'name'")
-    on_fail = str(raw.get("on_fail", "continue")).lower()
+    on_fail = str(raw.get("on_fail", "continue") or "continue").lower()
     if on_fail not in ON_FAIL_MODES:
         raise PlanError(f"on_fail must be one of {', '.join(ON_FAIL_MODES)}")
 
+    raw_instruments = raw.get("instruments") or {}
+    if not isinstance(raw_instruments, dict):
+        raise PlanError("instruments must be a mapping of alias -> resource/settings")
     instruments: dict[str, InstrumentSpec] = {}
-    for alias, spec in (raw.get("instruments") or {}).items():
+    for alias, spec in raw_instruments.items():
         instruments[str(alias)] = _instrument_from_dict(str(alias), spec)
 
     variables = raw.get("variables") or {}
@@ -288,6 +315,8 @@ def load_plan(path: str | Path) -> Plan:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
         raise PlanError(f"cannot read {path}: {exc}") from None
+    except UnicodeDecodeError:
+        raise PlanError(f"{path} is not UTF-8 encoded (save the file as UTF-8)") from None
     try:
         raw = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -307,4 +336,27 @@ def validate_plan(path: str | Path) -> list[str]:
         if step.has_limits and step.name in seen:
             problems.append(f"duplicate step name '{step.name}' (results will be ambiguous)")
         seen.add(step.name)
+        if step.limits:
+            try:
+                # static check: literal numeric limits must be coherent
+                Limits.from_spec(step.limits, resolve=_static_number, resolve_literal=lambda v: v)
+            except LimitError as exc:
+                problems.append(f"step '{step.name}': {exc}")
+            except _Dynamic:
+                pass  # depends on variables/measurements; checked at run time
     return problems
+
+
+class _Dynamic(Exception):
+    pass
+
+
+def _static_number(v: Any) -> Any:
+    if isinstance(v, bool):
+        raise _Dynamic
+    if isinstance(v, (int, float)):
+        return v
+    try:
+        return float(str(v))
+    except ValueError:
+        raise _Dynamic from None

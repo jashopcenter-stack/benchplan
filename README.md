@@ -12,7 +12,7 @@ $ benchplan run psu_regulation.yaml --serial SN-0042 --operator seb
 [FAIL]  Current limit engages                  1.49979 A    (2 A ±0.05 A)  -- 1.49979 < 1.95 (low limit)
 ...
 RESULT: FAIL   pass=9 fail=3 error=0 skip=0   (1.01 s)
-report: benchplan-results/dc-power-supply-acceptance-test_SN-0042_20261026-162537.html
+report: benchplan-results/dc-power-supply-acceptance-test_SN-0042_20261026-162537_7f3a1c.html
 ```
 
 ![benchplan HTML report](docs/report-fail-full.png)
@@ -57,6 +57,7 @@ on_fail: continue                 # or abort: stop at the first FAIL/ERROR (tear
 variables:                        # usable as {name} in commands and as names in expressions
   v_set: 5.0
   i_lim: 1.0
+  quick: false
 
 instruments:
   psu:
@@ -93,10 +94,24 @@ steps:
     units: mV
     limits: {max: 10}
 
+  - {instrument: psu, write: "CURR:LOAD {i_lim}"}        # unnamed write steps are fine
+  - name: Full-load output voltage
+    instrument: dmm
+    query: "MEAS:VOLT:DC? 10,0.0001"
+    units: V
+    limits: {min: "v_set * 0.98", max: "v_set * 1.02"}  # expressions allowed in numeric limits
+    save_as: v_fl
+
   - name: Load regulation
     expr: "(v_nl - v_fl) / v_nl * 100"
     units: "%"
     limits: {max: 0.5}
+
+  - name: Serial number programmed into DUT
+    instrument: psu
+    query: "SYST:SN?"
+    parse: str
+    limits: {equals: "{serial}"}  # equals/one_of/regex are literals: substituted, never evaluated
 
   - name: Skipped on quick runs
     instrument: dmm
@@ -118,7 +133,7 @@ teardown:                         # always runs, even after abort or an instrume
 | `parse` | `auto` (number if possible, else text), `float`, `int`, `str`, `bool` (`1/ON/TRUE/YES`). |
 | `scale` | Multiply numeric results (unit conversion). |
 | `units` | Shown next to values and limits. |
-| `limits` | `min`, `max`, `nominal` + `tol` (absolute) or `tol_pct` (%), `equals`, `one_of`, `regex`. Values may be numbers, `{placeholders}` or expressions. A step without limits is recorded as INFO. |
+| `limits` | `min`, `max`, `nominal` + `tol` (absolute) and/or `tol_pct` (%), `equals`, `one_of`, `regex`. Numeric limits may be numbers, `{placeholders}` or expressions; `equals`/`one_of`/`regex` are literals (placeholders substituted, nothing evaluated; `ON`/`TRUE`/`1` and `OFF`/`FALSE`/`0` are equivalent). A bare `nominal` without a tolerance is rejected. A step without limits is recorded as INFO. |
 | `save_as` | Store the value under this name for later `expr`/limits/placeholders. |
 | `retries`, `retry_delay_ms` | Repeat a failing/erroring step before giving up. |
 | `on_fail` | Per-step override of the plan-level `continue`/`abort`. |
@@ -137,6 +152,7 @@ Expressions are evaluated by a small sandboxed evaluator: arithmetic, comparison
 | `query_delay` | 0 | Seconds between write and read of a query (slow serial instruments). |
 | `check_errors` | false | Query `SYST:ERR?` after every write; a non-zero error fails the step. |
 | `visa_library` | (default) | e.g. `"@py"` to force pyvisa-py, or a path to a VISA DLL. |
+| `baud_rate` | – | Serial (ASRL) instruments only. |
 | `sim` | – | Simulation block, see below. |
 
 ### Simulated instruments
@@ -153,12 +169,13 @@ sim:
   commands:                                # regex (case-insensitive, full match) -> rule
     'VOLT (?P<v>[-\d.]+)':  {set: {v_set: "v"}}          # named groups become variables
     'OUTP (?P<s>ON|OFF)':   {set: {out: "1 if s == 'ON' else 0"}}
-    'VOLT\?':               {response: "v_set"}
+    'VOLT\?':               {response: "v_set"}                 # response: an expression
     'MEAS:VOLT\?':          {response: "v_out + gauss(0, 0.002)"}
-    '\*IDN\?':              "ACME,PSU-1,0001,1.0"        # plain strings are format strings: "{v_set}"
+    'SYST:ERR\?':           {text: '0,"No error"'}             # text: a literal, never evaluated
+    '\*IDN\?':              "ACME,PSU-1,0001,1.0"              # plain string = literal format string ("{v_set}" works)
 ```
 
-`*IDN?`, `*RST` (restores the initial state), `*CLS`, `*OPC?` and `SYST:ERR?` have built-in defaults. Unknown writes are accepted silently; unknown queries raise an ERROR for the step.
+`*IDN?`, `*RST` (restores the initial state), `*CLS`, `*OPC?` and `SYST:ERR?` have built-in defaults. Unknown writes are accepted silently; unknown queries raise an ERROR for the step. Simulated state lives inside one `Runner`, so consecutive runs never leak state into each other.
 
 ## Python API
 
@@ -173,13 +190,13 @@ for step in result.tests:
 paths = write_all(result, "reports", plan.slug)   # {'html': ..., 'json': ..., 'csv': ...}
 ```
 
-`Runner(plan, on_step=callback)` streams `StepResult`s as they complete — handy for a GUI or a fixture PLC. `Runner(plan, open_fn=my_factory)` lets you plug in your own instrument classes (anything with `write()`/`query()`/`close()`).
+`Runner(plan, on_step=callback)` streams `StepResult`s as they complete — handy for a GUI or a fixture PLC (an exception inside the callback never aborts the run). `Runner(plan, open_fn=my_factory)` lets you plug in your own instrument classes: anything with `write(cmd)`, `query(cmd) -> str` and `close()`.
 
 ## Outputs
 
 * `<plan>_<serial>_<timestamp>.html` – self-contained report (no external assets, prints cleanly).
 * `<plan>_<serial>_<timestamp>.json` – full machine-readable record (steps, raw responses, limits, variables, instrument IDNs).
-* `results.csv` – appended on every run, one row per step; load it straight into Excel, pandas or a database for yield and trend analysis.
+* `results.csv` – appended on every run, one row per step (UTF-8 with BOM, so Excel opens it cleanly); load it into Excel, pandas or a database for yield and trend analysis.
 
 Exit codes: `0` PASS · `1` FAIL · `2` ERROR (instrument/communication problem) · `3` invalid plan.
 
@@ -190,7 +207,7 @@ pip install ".[dev]"
 pytest
 ```
 
-65 tests cover the expression sandbox, limit logic, plan validation, the runner (retries, abort, skip, placeholders, derived steps), report writers and the CLI, including a round-trip through PyVISA's `pyvisa-sim` backend.
+99 tests cover the expression sandbox (including resource bombs such as `9**9**9`), limit logic, plan validation, the runner (retries, abort, skip, placeholders, derived steps, state isolation), report writers and the CLI, including a round-trip through PyVISA's `pyvisa-sim` backend.
 
 ## Roadmap
 

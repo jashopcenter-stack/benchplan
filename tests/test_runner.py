@@ -164,3 +164,91 @@ def test_pyvisa_sim_backend_roundtrip():
     r = run_plan(plan)
     assert r.status == "PASS", [(s.name, s.status, s.message) for s in r.steps]
     assert "SCPI,MOCK" in r.instruments["dev"]
+
+
+def test_equals_with_serial_placeholder_is_literal():
+    plan = plan_from_dict({
+        "name": "sn", "instruments": {"d": {"resource": "sim://d", "sim": {"commands": {r"SN\?": "1234-5678"}}}},
+        "steps": [
+            {"name": "serial readback", "instrument": "d", "query": "SN?", "parse": "str", "limits": {"equals": "{serial}"}},
+            {"name": "serial regex", "instrument": "d", "query": "SN?", "parse": "str", "limits": {"regex": "^{serial}$"}},
+        ],
+    })
+    r = run_plan(plan, serial="1234-5678")
+    assert r.status == "PASS", [(s.name, s.message) for s in r.steps]
+    assert run_plan(plan, serial="1234-5679").status == "FAIL"
+
+
+def test_sim_state_is_isolated_between_runs_via_api():
+    def mk(v, d):
+        return plan_from_dict({
+            "name": "iso", "instruments": {"p": {"resource": "sim://p", "sim": {
+                "state_group": "bench", "state": {"v": v}, "derived": {"d": d},
+                "commands": {r"V (?P<x>[-\d.]+)": {"set": {"v": "x"}}, r"D\?": {"response": "d"}}}}},
+            "setup": [{"instrument": "p", "write": "V 7"}] if v == 1 else [],
+            "steps": [{"name": "d", "instrument": "p", "query": "D?", "save_as": "d"}],
+        })
+    assert run_plan(mk(1, "v*2")).measurements["d"] == 14.0
+    assert run_plan(mk(5, "v*3")).measurements["d"] == 15.0   # not 14 or 21
+
+
+def test_seed_is_honoured_from_any_group_member():
+    def mk(seed_on):
+        inst = {}
+        for alias in ("a", "b"):
+            sim = {"state_group": "g", "commands": {r"N\?": {"response": "gauss(0, 1)"}}}
+            if alias == seed_on:
+                sim["seed"] = 42
+            inst[alias] = {"resource": f"sim://{alias}", "sim": sim}
+        return plan_from_dict({"name": "seed", "instruments": inst,
+                               "steps": [{"name": "n", "instrument": "b", "query": "N?", "save_as": "n"}]})
+    assert run_plan(mk("a")).measurements["n"] == run_plan(mk("a")).measurements["n"]
+    assert run_plan(mk("b")).measurements["n"] == run_plan(mk("b")).measurements["n"]
+
+
+def test_sim_text_is_literal_and_response_is_expression():
+    plan = plan_from_dict({
+        "name": "t", "instruments": {"d": {"resource": "sim://d", "sim": {"commands": {
+            r"ERR\?": {"text": '0,"No error"'}, r"E\?": {"response": "e"}, r"BAD\?": {"response": "no such name"}}}}},
+        "steps": [
+            {"name": "err", "instrument": "d", "query": "ERR?", "parse": "str", "limits": {"regex": "No error"}},
+            {"name": "e", "instrument": "d", "query": "E?", "limits": {"nominal": 2.718282, "tol": 1e-5}},
+            {"name": "bad", "instrument": "d", "query": "BAD?", "limits": {"max": 1}},
+        ],
+    })
+    r = run_plan(plan)
+    assert [s.status for s in r.steps] == ["PASS", "PASS", "ERROR"]
+    assert "use 'text:'" in r.steps[2].message
+
+
+def test_on_step_exception_does_not_abort_run():
+    calls = []
+
+    def bad_logger(sr):
+        calls.append(sr.name)
+        raise UnicodeEncodeError("cp1252", "≤", 0, 1, "nope")
+
+    r = Runner(load_plan(EXAMPLE), on_step=bad_logger).run()
+    assert r.status == "PASS" and len(calls) == len(r.steps)
+
+
+def test_custom_instrument_without_idn():
+    class Fake:
+        def __init__(self, spec): self.spec = spec
+        def write(self, c): pass
+        def query(self, c): return "4.2"
+        def close(self): pass
+
+    plan = plan_from_dict({"name": "f", "instruments": {"x": "sim://x"},
+                           "steps": [{"name": "q", "instrument": "x", "query": "V?", "limits": {"max": 5}}]})
+    r = Runner(plan, open_fn=Fake).run()
+    assert r.status == "PASS" and r.instruments["x"] == "sim://x"
+
+
+def test_hostile_var_cannot_hang_the_run():
+    plan = plan_from_dict({"name": "h", "instruments": {"x": "sim://x"},
+                           "steps": [{"name": "q", "instrument": "x", "query": "*IDN?", "parse": "str",
+                                      "limits": {"regex": "{bomb}"}},
+                                     {"name": "n", "expr": "1", "limits": {"max": "{bomb}"}}]})
+    r = run_plan(plan, variables={"bomb": "9**9**9"})
+    assert r.steps[1].status == "ERROR" and "exponent" in r.steps[1].message

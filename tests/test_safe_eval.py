@@ -43,3 +43,27 @@ def test_numbers_pass_through():
 def test_rejects_unsafe_or_invalid(bad):
     with pytest.raises(ExprError):
         safe_eval(bad, {"x": 1})
+
+
+@pytest.mark.parametrize("bomb", [
+    "9**9**9",
+    "10**10**8",
+    "2**100000",
+    "'a' * 10**9",
+    "[0] * 10**7",
+    "('a' * 50000) + ('b' * 60000)",
+    "1" + "+1" * 100000,
+    "(" * 500 + "1" + ")" * 500,
+])
+def test_resource_bombs_are_rejected_quickly(bomb):
+    import time
+    t0 = time.perf_counter()
+    with pytest.raises(ExprError):
+        safe_eval(bomb)
+    assert time.perf_counter() - t0 < 2.0
+
+
+def test_big_but_reasonable_math_still_works():
+    assert safe_eval("2**64") == 2**64
+    assert safe_eval("'ab' * 3") == "ababab"
+    assert safe_eval("1e308 * 10") == float("inf")

@@ -14,7 +14,7 @@ from importlib import resources as ires
 from pathlib import Path
 
 from . import __version__
-from .instruments import InstrumentError, list_resources, reset_sim_groups
+from .instruments import InstrumentError, list_resources
 from .plan import PlanError, load_plan, validate_plan
 from .report import console_line, summary_lines, write_all
 from .runner import Runner
@@ -28,13 +28,26 @@ def _parse_vars(items: list[str] | None) -> dict:
         if "=" not in item:
             raise SystemExit(f"--var expects NAME=VALUE, got {item!r}")
         k, v = item.split("=", 1)
-        k = k.strip()
-        v = v.strip()
+        k, v = k.strip(), v.strip()
+        if not k:
+            raise SystemExit(f"--var expects NAME=VALUE, got {item!r}")
         try:
-            out[k] = int(v) if v.lstrip("-").isdigit() else float(v)
+            out[k] = int(v)
         except ValueError:
-            out[k] = v
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
     return out
+
+
+def _console_safe() -> None:
+    """Never let a terminal code page (cp1252 on Windows) break a run because of '±' or '≤'."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
 def _run(plan_path: Path, args) -> int:
@@ -43,7 +56,6 @@ def _run(plan_path: Path, args) -> int:
     except PlanError as exc:
         print(f"plan error: {exc}", file=sys.stderr)
         return EXIT_INVALID
-    reset_sim_groups()
     if args.seed is not None:
         for spec in plan.instruments.values():
             if spec.is_sim:
@@ -59,13 +71,17 @@ def _run(plan_path: Path, args) -> int:
                     on_fail="abort" if args.abort_on_fail else None,
                     on_step=(lambda r: None) if quiet else (lambda r: print(console_line(r))))
     result = runner.run()
-    paths = write_all(result, args.out, plan.slug)
+    try:
+        paths = write_all(result, args.out, plan.slug)
+    except OSError as exc:
+        print(f"cannot write results to {args.out}: {exc}", file=sys.stderr)
+        for line in summary_lines(result):
+            print(line, file=sys.stderr)
+        return EXIT_ERROR
     if not quiet:
         for line in summary_lines(result):
             print(line)
         print(f"report: {paths['html']}")
-    elif args.json:
-        pass
     if args.json:
         print(paths["json"].read_text(encoding="utf-8"))
     return {"PASS": EXIT_PASS, "FAIL": EXIT_FAIL}.get(result.status, EXIT_ERROR)
@@ -76,6 +92,7 @@ def _demo_plan_path() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _console_safe()
     p = argparse.ArgumentParser(prog="benchplan",
                                 description="Run YAML test plans against SCPI instruments and get pass/fail reports.")
     p.add_argument("--version", action="version", version=f"benchplan {__version__}")
@@ -104,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     sp_res = sub.add_parser("resources", help="list VISA resources")
     sp_res.add_argument("--visa-library", default="", help='e.g. "@py" for pyvisa-py')
 
-    sp_ex = sub.add_parser("example", help="print the bundled example plan (copy it as a starting point)")
+    sub.add_parser("example", help="print the bundled example plan (copy it as a starting point)")
 
     args = p.parse_args(argv)
 

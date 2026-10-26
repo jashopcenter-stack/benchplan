@@ -60,6 +60,13 @@ def test_auto_named_steps():
     (_minimal(instruments={"psu": {"timeout_ms": 1}}), "needs a 'resource'"),
     (_minimal(instruments={"bad alias": "sim://x"}), "valid identifier"),
     (_minimal(variables={"9x": 1}), "valid identifier"),
+    (_minimal(steps=[{"name": "a", "instrument": "psu", "query": "A?", "retries": "two"}]), "'retries' must be int"),
+    (_minimal(steps=[{"name": "a", "instrument": "psu", "query": "A?", "scale": "1k"}]), "'scale' must be float"),
+    (_minimal(steps=[{"delay_ms": "long"}]), "'delay_ms' must be float"),
+    (_minimal(instruments={"psu": {"resource": "sim://p", "timeout_ms": "5s"}}), "'timeout_ms' must be int"),
+    (_minimal(instruments=[{"psu": "sim://p"}]), "instruments must be a mapping"),
+    (_minimal(instruments={"psu": {"resource": "sim://p", "sim": {"commands": ["x"]}}}), "sim.commands must be a mapping"),
+    (_minimal(steps=[{"delay_ms": 5, "limits": {"max": 1}}]), "delay steps cannot have limits"),
 ])
 def test_validation_errors(raw, msg):
     with pytest.raises(PlanError) as exc:
@@ -84,3 +91,17 @@ def test_termination_unescape():
 def test_example_is_valid_yaml_for_docs():
     raw = yaml.safe_load(EXAMPLE.read_text())
     assert raw["on_fail"] == "continue"
+
+
+def test_validate_catches_static_limit_mistakes(tmp_path):
+    bad = tmp_path / "lim.yaml"
+    bad.write_text("name: x\ninstruments: {p: sim://p}\nsteps:\n  - {name: a, instrument: p, query: 'A?', limits: {nominal: 5}}\n")
+    problems = validate_plan(bad)
+    assert problems and "nominal needs a tolerance" in problems[0]
+
+
+def test_non_utf8_plan_is_a_plan_error(tmp_path):
+    bad = tmp_path / "ansi.yaml"
+    bad.write_bytes("name: temp \xb0C\nsteps: []\n".encode("latin-1"))
+    problems = validate_plan(bad)
+    assert problems and "UTF-8" in problems[0]

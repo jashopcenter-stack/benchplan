@@ -19,7 +19,7 @@ def result():
 def test_write_all_produces_html_json_csv(tmp_path, result):
     paths = write_all(result, tmp_path, "psu")
     assert paths["html"].exists() and paths["json"].exists() and paths["csv"].exists()
-    assert "SN_7-A" in paths["html"].name  # serial sanitised in file names
+    assert "SN-7-A" in paths["html"].name and result.run_id[:6] in paths["html"].name  # sanitised + unique
 
     html = paths["html"].read_text(encoding="utf-8")
     assert "DC Power Supply Acceptance Test" in html
@@ -32,14 +32,14 @@ def test_write_all_produces_html_json_csv(tmp_path, result):
     assert data["counts"]["PASS"] == sum(1 for s in data["steps"] if s["status"] == "PASS")
     assert data["measurements"]["v_nl"] > 4.9
 
-    rows = list(csv.DictReader(paths["csv"].open(encoding="utf-8")))
+    rows = list(csv.DictReader(paths["csv"].open(encoding="utf-8-sig")))
     assert len(rows) == len(result.steps)
     assert rows[0]["run_id"] == result.run_id and rows[0]["plan"] == result.plan_name
 
     # a second run appends, keeping one header
     reset_sim_groups()
     write_all(run_plan(load_plan(EXAMPLE), serial="SN2"), tmp_path, "psu")
-    rows2 = list(csv.DictReader(paths["csv"].open(encoding="utf-8")))
+    rows2 = list(csv.DictReader(paths["csv"].open(encoding="utf-8-sig")))
     assert len(rows2) == 2 * len(result.steps)
     assert {r["serial"] for r in rows2} == {"SN 7/A", "SN2"}
 
@@ -58,3 +58,19 @@ def test_console_and_summary_lines(result):
     assert any(line.startswith("[PASS]") and "V" in line for line in lines)
     summary = "\n".join(summary_lines(result))
     assert "RESULT: PASS" in summary and "SN 7/A" in summary
+
+
+def test_json_never_contains_nan(tmp_path, result):
+    result.steps[2].value = float("nan")
+    result.measurements["bad"] = float("inf")
+    from benchplan import write_json
+    path = write_json(result, tmp_path / "r.json")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["steps"][2]["value"] is None and data["measurements"]["bad"] is None
+
+
+def test_file_names_are_filesystem_safe(tmp_path):
+    reset_sim_groups()
+    r = run_plan(load_plan(EXAMPLE), serial='A:B*C?"<>|\\D')
+    paths = write_all(r, tmp_path, "x")
+    assert paths["html"].exists() and "A-B-C-D" in paths["html"].name

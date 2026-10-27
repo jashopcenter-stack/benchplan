@@ -30,7 +30,7 @@ dev = ["pytest>=7", "pyvisa>=1.13", "pyvisa-sim>=0.6"]
 benchplan = "benchplan.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/CHANGE-ME/benchplan"
+Homepage = "https://github.com/jashopcenter-stack/benchplan"
 
 [tool.setuptools.packages.find]
 include = ["benchplan*"]

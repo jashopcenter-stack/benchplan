@@ -25,6 +25,7 @@ report: benchplan-results/dc-power-supply-acceptance-test_SN-0042_20261026-16253
 * **Develop without hardware.** Instruments can be *simulated inside the plan file* (stateful, with noise), so a plan can be written, demoed and unit-tested before the DUT or the instruments exist.
 * **Traceable output.** Every run writes a self-contained HTML report, a JSON record and appends one row per step to a long-format `results.csv` (run id, serial, operator, timestamp, value, limits, status). Exit code = PASS/FAIL/ERROR, so it drops into any fixture controller or CI job.
 * **Retries, abort-on-fail, skip conditions, setup/teardown** that always runs — the things real benches need.
+* **⚡ Want batteries included?** The [**Instrument Automation Starter Kit**](https://shopcentered.gumroad.com/l/xeqouf) adds ready-to-use drivers for Rigol, Keysight and Siglent instruments, four runnable test plans, example scripts and a 20-page PDF guide — built on benchplan. [Get it on Gumroad →](https://shopcentered.gumroad.com/l/xeqouf)
 
 ## Install
 
